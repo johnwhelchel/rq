@@ -8,7 +8,6 @@ from functools import partial
 from uuid import uuid4
 
 from rq.compat import as_text, decode_redis_hash, string_types, text_type
-
 from .connections import resolve_connection
 from .exceptions import NoSuchJobError, UnpickleError
 from .local import LocalStack
@@ -31,6 +30,7 @@ JobStatus = enum(
     FINISHED='finished',
     FAILED='failed',
     STARTED='started',
+    CANCELED='canceled',
     DEFERRED='deferred'
 )
 
@@ -454,9 +454,18 @@ class Job(object):
         self.timeout = int(obj.get('timeout')) if obj.get('timeout') else None
         self.result_ttl = int(obj.get('result_ttl')) if obj.get('result_ttl') else None  # noqa
         self._status = as_text(obj.get('status') if obj.get('status') else None)
-        self._dependency_ids = as_text(obj.get('dependency_ids', '')).split(' ')
         self.ttl = int(obj.get('ttl')) if obj.get('ttl') else None
         self.meta = unpickle(obj.get('meta')) if obj.get('meta') else {}
+
+        if obj.get('dependency_ids'):
+            self._dependency_ids =  as_text(obj.get('dependency_ids', '')).split(' ')
+        else:
+            self._dependency_ids = []
+
+        if obj.get('dependency_ids'):
+            self._dependency_ids =  as_text(obj.get('dependency_ids', '')).split(' ')
+        else:
+            self._dependency_ids = []
 
     def to_dict(self):
         """Returns a serialization of the current job instance"""
@@ -510,11 +519,30 @@ class Job(object):
         cancellation.
         """
         from .queue import Queue
+        from.registry import DeferredJobRegistry
+        self.set_status(JobStatus.CANCELED)
         pipeline = self.connection._pipeline()
         if self.origin:
             queue = Queue(name=self.origin, connection=self.connection)
             queue.remove(self, pipeline=pipeline)
+            DeferredJobRegistry(
+                name=self.origin,
+                connection=self.connection).remove(self, pipeline=pipeline)
         pipeline.execute()
+
+        if self.dependents is not None:
+            for dependent in self.dependents:
+                if dependent.get_status() != JobStatus.CANCELED:
+                    dependent.cancel()
+
+        if self.dependencies is not None:
+            for dependency in self.dependencies:
+                if dependency.get_status() != JobStatus.CANCELED:
+                    dependency.cancel()
+
+        self.connection.delete(self.dependents_key)
+        self.connection.delete(self.dependencies_key)
+        self.connection.expire(self.key, 2)
 
     def delete(self, pipeline=None):
         """Cancels the job and deletes the job hash from Redis."""
