@@ -311,7 +311,6 @@ class Queue(object):
             dependent = self.job_class.fetch(job_id, connection=self.connection)
             registry = DeferredJobRegistry(dependent.origin, self.connection)
             with self.connection._pipeline() as pipeline:
-                registry.remove(dependent, pipeline=pipeline)
                 dependent.remove_dependency(job.id)
                 if not dependent.has_unmet_dependencies():
                     if dependent.origin == self.name:
@@ -320,6 +319,7 @@ class Queue(object):
                         queue = Queue(name=dependent.origin,
                                       connection=self.connection)
                         queue.enqueue_job(dependent, pipeline=pipeline)
+                    registry.remove(dependent, pipeline=pipeline)
                 pipeline.execute()
 
     def pop_job_id(self):
