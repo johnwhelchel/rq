@@ -600,10 +600,9 @@ class Job(object):
         registry.add(self, pipeline=pipeline)
 
         connection = pipeline if pipeline is not None else self.connection
-        connection.sadd(Job.dependencies_key_for(self.id),
-            *[dependency.id for dependency in dependencies])
 
         for dependency in dependencies:
+            connection.sadd(Job.dependencies_key_for(self.id), dependency.id)
             connection.sadd(Job.dependents_key_for(dependency.id), self.id)
 
     def __str__(self):
