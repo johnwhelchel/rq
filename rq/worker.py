@@ -575,6 +575,9 @@ class Worker(object):
                 # to use the same exc handling when pickling fails
                 job._result = rv
 
+                if job.get_status() in [None, JobStatus.CANCELED]:
+                    job.on_cancel_request()
+
                 self.set_current_job_id(None, pipeline=pipeline)
 
                 result_ttl = job.get_result_ttl(self.default_result_ttl)

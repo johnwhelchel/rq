@@ -89,7 +89,8 @@ class Job(object):
     @classmethod
     def create(cls, func, args=None, kwargs=None, connection=None,
                result_ttl=None, ttl=None, status=None, description=None,
-               depends_on=None, timeout=None, id=None, origin=None, meta=None):
+               depends_on=None, timeout=None, id=None, origin=None, meta=None,
+               on_cancel=None):
         """Creates a new Job instance for the given function, arguments, and
         keyword arguments.
         """
@@ -134,6 +135,8 @@ class Job(object):
         job.timeout = timeout
         job._status = status
         job.meta = meta or {}
+        job.on_cancel = '{0}.{1}'.format(on_cancel.__module__,
+                                         on_cancel.__name__) if on_cancel else None
 
         # dependencies could be a single job or a list of jobs
         if depends_on:
@@ -342,6 +345,7 @@ class Job(object):
         self._status = None
         self._dependency_ids = None
         self.meta = {}
+        self.on_cancel = None
 
     def __repr__(self):  # noqa
         return 'Job({0!r}, enqueued_at={1!r})'.format(self._id, self.enqueued_at)
@@ -456,6 +460,7 @@ class Job(object):
         self._status = as_text(obj.get('status') if obj.get('status') else None)
         self.ttl = int(obj.get('ttl')) if obj.get('ttl') else None
         self.meta = unpickle(obj.get('meta')) if obj.get('meta') else {}
+        self.on_cancel = as_text(obj.get('on_cancel')) if obj.get('on_cancel') else None
 
         if obj.get('dependency_ids'):
             self._dependency_ids =  as_text(obj.get('dependency_ids', '')).split(' ')
@@ -499,6 +504,8 @@ class Job(object):
             obj['meta'] = dumps(self.meta)
         if self.ttl:
             obj['ttl'] = self.ttl
+        if self.on_cancel:
+            obj['on_cancel'] = self.on_cancel
 
         return obj
 
@@ -632,6 +639,10 @@ class Job(object):
         for dependency in dependencies:
             connection.sadd(Job.dependencies_key_for(self.id), dependency.id)
             connection.sadd(Job.dependents_key_for(dependency.id), self.id)
+
+    def on_cancel_request(self):
+        if self.on_cancel is not None:
+            import_attribute(self.on_cancel)()
 
     def __str__(self):
         return '<Job {0}: {1}>'.format(self.id, self.description)
