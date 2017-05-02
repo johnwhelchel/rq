@@ -549,9 +549,6 @@ class Job(object):
         connection.delete(self.key)
         connection.delete(self.dependents_key)
 
-        if self.origin:
-            registry = StartedJobRegistry(name=self.origin, connection=self.connection)
-            registry.remove(self)
 
     # Job execution
     def perform(self):  # noqa

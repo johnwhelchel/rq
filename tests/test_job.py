@@ -411,13 +411,11 @@ class TestJob(RQTestCase):
         """job.delete() deletes itself & dependents mapping from Redis."""
         queue = Queue(connection=self.testconn)
         job = queue.enqueue(fixtures.say_hello)
-        registry = StartedJobRegistry(job.origin, self.testconn)
         job2 = Job.create(func=fixtures.say_hello, depends_on=job)
         job2.register_dependency()
         job.delete()
         self.assertFalse(self.testconn.exists(job.key))
         self.assertFalse(self.testconn.exists(job.dependents_key))
-        self.assertEqual(registry.get_job_ids(), [])
 
         self.assertNotIn(job.id, queue.get_job_ids())
 
