@@ -10,9 +10,9 @@ from tests.helpers import strip_microseconds
 
 from rq.compat import PY2, as_text
 from rq.exceptions import NoSuchJobError, UnpickleError
-from rq.job import Job, get_current_job, JobStatus
-from rq.queue import Queue
-from rq.registry import DeferredJobRegistry, StartedJobRegistry
+from rq.job import Job, get_current_job, JobStatus, cancel_job, requeue_job
+from rq.queue import Queue, get_failed_queue
+from rq.registry import DeferredJobRegistry
 from rq.utils import utcformat
 from rq.worker import Worker
 
@@ -46,10 +46,12 @@ class TestJob(RQTestCase):
     def test_create_empty_job(self):
         """Creation of new empty jobs."""
         job = Job()
+        job.description = 'test job'
 
         # Jobs have a random UUID and a creation date
         self.assertIsNotNone(job.id)
         self.assertIsNotNone(job.created_at)
+        self.assertEqual(str(job), "<Job %s: test job>" % job.id)
 
         # ...and nothing else
         self.assertIsNone(job.origin)
@@ -67,6 +69,12 @@ class TestJob(RQTestCase):
             job.args
         with self.assertRaises(ValueError):
             job.kwargs
+
+    def test_create_param_errors(self):
+        """Creation of jobs may result in errors"""
+        self.assertRaises(TypeError, Job.create, fixtures.say_hello, args="string")
+        self.assertRaises(TypeError, Job.create, fixtures.say_hello, kwargs="string")
+        self.assertRaises(TypeError, Job.create, func=42)
 
     def test_create_typical_job(self):
         """Creation of jobs for function calls."""
@@ -264,6 +272,26 @@ class TestJob(RQTestCase):
         job2 = Job.fetch(job.id)
         self.assertEqual(job2.meta['foo'], 'bar')
 
+    def test_custom_meta_is_rewriten_by_save_meta(self):
+        """New meta data can be stored by save_meta."""
+        job = Job.create(func=fixtures.say_hello, args=('Lionel',))
+        job.save()
+        serialized = job.to_dict()
+
+        job.meta['foo'] = 'bar'
+        job.save_meta()
+
+        raw_meta = self.testconn.hget(job.key, 'meta')
+        self.assertEqual(loads(raw_meta)['foo'], 'bar')
+
+        job2 = Job.fetch(job.id)
+        self.assertEqual(job2.meta['foo'], 'bar')
+
+        # nothing else was changed
+        serialized2 = job2.to_dict()
+        serialized2.pop('meta')
+        self.assertDictEqual(serialized, serialized2)
+
     def test_result_ttl_is_persisted(self):
         """Ensure that job's result_ttl is set properly"""
         job = Job.create(func=fixtures.say_hello, args=('Lionel',), result_ttl=10)
@@ -302,6 +330,7 @@ class TestJob(RQTestCase):
         q.enqueue(fixtures.access_self)  # access_self calls get_current_job() and asserts
         w = Worker([q])
         w.work(burst=True)
+        assert get_failed_queue(self.testconn).count == 0
 
     def test_job_access_within_synchronous_job_function(self):
         queue = Queue(async=False)
@@ -310,6 +339,13 @@ class TestJob(RQTestCase):
     def test_job_async_status_finished(self):
         queue = Queue(async=False)
         job = queue.enqueue(fixtures.say_hello)
+        self.assertEqual(job.result, 'Hi there, Stranger!')
+        self.assertEqual(job.get_status(), JobStatus.FINISHED)
+
+    def test_enqueue_job_async_status_finished(self):
+        queue = Queue(async=False)
+        job = Job.create(func=fixtures.say_hello)
+        job = queue.enqueue_job(job)
         self.assertEqual(job.result, 'Hi there, Stranger!')
         self.assertEqual(job.get_status(), JobStatus.FINISHED)
 
@@ -371,20 +407,6 @@ class TestJob(RQTestCase):
         job.cleanup(ttl=0)
         self.assertRaises(NoSuchJobError, Job.fetch, job.id, self.testconn)
 
-    def test_register_dependency(self):
-        """Ensure dependency registration works properly."""
-        origin = 'some_queue'
-        registry = DeferredJobRegistry(origin, self.testconn)
-
-        job = Job.create(func=fixtures.say_hello, origin=origin)
-        job._dependency_id = 'id'
-        job.save()
-
-        self.assertEqual(registry.get_job_ids(), [])
-        job.register_dependency()
-        self.assertEqual(as_text(self.testconn.spop('rq:job:id:dependents')), job.id)
-        self.assertEqual(registry.get_job_ids(), [job.id])
-
     def test_delete(self):
         """job.delete() deletes itself & dependents mapping from Redis."""
         queue = Queue(connection=self.testconn)
@@ -429,3 +451,36 @@ class TestJob(RQTestCase):
         queue.enqueue(fixtures.say_hello, job_id="1234", ttl=1)
         time.sleep(1)
         self.assertEqual(0, len(queue.get_jobs()))
+
+    def test_create_and_cancel_job(self):
+        """test creating and using cancel_job deletes job properly"""
+        queue = Queue(connection=self.testconn)
+        job = queue.enqueue(fixtures.say_hello)
+        self.assertEqual(1, len(queue.get_jobs()))
+        cancel_job(job.id)
+        self.assertEqual(0, len(queue.get_jobs()))
+
+    def test_create_failed_and_cancel_job(self):
+        """test creating and using cancel_job deletes job properly"""
+        failed_queue = get_failed_queue(connection=self.testconn)
+        job = failed_queue.enqueue(fixtures.say_hello)
+        job.set_status(JobStatus.FAILED)
+        self.assertEqual(1, len(failed_queue.get_jobs()))
+        cancel_job(job.id)
+        self.assertEqual(0, len(failed_queue.get_jobs()))
+
+    def test_create_and_requeue_job(self):
+        """Requeueing existing jobs."""
+        job = Job.create(func=fixtures.div_by_zero, args=(1, 2, 3))
+        job.origin = 'fake'
+        job.save()
+        get_failed_queue().quarantine(job, Exception('Some fake error'))  # noqa
+
+        self.assertEqual(Queue.all(), [get_failed_queue()])  # noqa
+        self.assertEqual(get_failed_queue().count, 1)
+
+        requeued_job = requeue_job(job.id)
+
+        self.assertEqual(get_failed_queue().count, 0)
+        self.assertEqual(Queue('fake').count, 1)
+        self.assertEqual(requeued_job.origin, job.origin)

@@ -14,19 +14,22 @@ import traceback
 import warnings
 from datetime import timedelta
 
+from redis import WatchError
+
 from rq.compat import as_text, string_types, text_type
 
-from .connections import get_current_connection
+from .compat import PY2
+from .connections import get_current_connection, push_connection, pop_connection
 from .defaults import DEFAULT_RESULT_TTL, DEFAULT_WORKER_TTL
-from .exceptions import DequeueTimeout
+from .exceptions import DequeueTimeout, ShutDownImminentException
 from .job import Job, JobStatus
 from .logutils import setup_loghandlers
 from .queue import Queue, get_failed_queue
 from .registry import FinishedJobRegistry, StartedJobRegistry, clean_registries
 from .suspension import is_suspended
 from .timeouts import UnixSignalDeathPenalty
-from .utils import (ensure_list, enum, import_attribute, make_colorizer,
-                    utcformat, utcnow, utcparse)
+from .utils import (backend_class, ensure_list, enum,
+                    make_colorizer, utcformat, utcnow, utcparse)
 from .version import VERSION
 
 try:
@@ -54,17 +57,22 @@ def iterable(x):
 def compact(l):
     return [x for x in l if x is not None]
 
+
 _signames = dict((getattr(signal, signame), signame)
                  for signame in dir(signal)
                  if signame.startswith('SIG') and '_' not in signame)
 
 
 def signal_name(signum):
-    # Hackety-hack-hack: is there really no better way to reverse lookup the
-    # signal name?  If you read this and know a way: please provide a patch :)
     try:
-        return _signames[signum]
+        if sys.version_info[:2] >= (3, 5):
+            return signal.Signals(signum).name
+        else:
+            return _signames[signum]
+
     except KeyError:
+        return 'SIG_UNKNOWN'
+    except ValueError:
         return 'SIG_UNKNOWN'
 
 
@@ -85,18 +93,22 @@ class Worker(object):
     job_class = Job
 
     @classmethod
-    def all(cls, connection=None):
+    def all(cls, connection=None, job_class=None, queue_class=None):
         """Returns an iterable of all Workers.
         """
         if connection is None:
             connection = get_current_connection()
         reported_working = connection.smembers(cls.redis_workers_keys)
-        workers = [cls.find_by_key(as_text(key), connection)
+        workers = [cls.find_by_key(as_text(key),
+                                   connection=connection,
+                                   job_class=job_class,
+                                   queue_class=queue_class)
                    for key in reported_working]
         return compact(workers)
 
     @classmethod
-    def find_by_key(cls, worker_key, connection=None):
+    def find_by_key(cls, worker_key, connection=None, job_class=None,
+                    queue_class=None):
         """Returns a Worker instance, based on the naming conventions for
         naming the internal Redis keys.  Can be used to reverse-lookup Workers
         by their Redis keys.
@@ -112,23 +124,36 @@ class Worker(object):
             return None
 
         name = worker_key[len(prefix):]
-        worker = cls([], name, connection=connection)
-        queues = as_text(connection.hget(worker.key, 'queues'))
-        worker._state = as_text(connection.hget(worker.key, 'state') or '?')
-        worker._job_id = connection.hget(worker.key, 'current_job') or None
+        worker = cls([],
+                     name,
+                     connection=connection,
+                     job_class=job_class,
+                     queue_class=queue_class)
+        queues, state, job_id = connection.hmget(worker.key, 'queues', 'state', 'current_job')
+        queues = as_text(queues)
+        worker._state = as_text(state or '?')
+        worker._job_id = job_id or None
         if queues:
-            worker.queues = [cls.queue_class(queue, connection=connection)
+            worker.queues = [worker.queue_class(queue,
+                                                connection=connection,
+                                                job_class=job_class)
                              for queue in queues.split(',')]
         return worker
 
-    def __init__(self, queues, name=None,
-                 default_result_ttl=None, connection=None, exc_handler=None,
-                 exception_handlers=None, default_worker_ttl=None, job_class=None):  # noqa
+    def __init__(self, queues, name=None, default_result_ttl=None, connection=None,
+                 exc_handler=None, exception_handlers=None, default_worker_ttl=None,
+                 job_class=None, queue_class=None):  # noqa
         if connection is None:
             connection = get_current_connection()
         self.connection = connection
 
-        queues = [self.queue_class(name=q) if isinstance(q, text_type) else q
+        self.job_class = backend_class(self, 'job_class', override=job_class)
+        self.queue_class = backend_class(self, 'queue_class', override=queue_class)
+
+        queues = [self.queue_class(name=q,
+                                   connection=connection,
+                                   job_class=self.job_class)
+                  if isinstance(q, string_types) else q
                   for q in ensure_list(queues)]
         self._name = name
         self.queues = queues
@@ -148,7 +173,8 @@ class Worker(object):
         self._horse_pid = 0
         self._stop_requested = False
         self.log = logger
-        self.failed_queue = get_failed_queue(connection=self.connection)
+        self.failed_queue = get_failed_queue(connection=self.connection,
+                                             job_class=self.job_class)
         self.last_cleaned_at = None
 
         # By default, push the "move-to-failed-queue" exception handler onto
@@ -167,16 +193,11 @@ class Worker(object):
         elif exception_handlers is not None:
             self.push_exc_handler(exception_handlers)
 
-        if job_class is not None:
-            if isinstance(job_class, string_types):
-                job_class = import_attribute(job_class)
-            self.job_class = job_class
-
     def validate_queues(self):
         """Sanity check for the given queues."""
         for queue in self.queues:
             if not isinstance(queue, self.queue_class):
-                raise TypeError('{0} is not of type {1} or text type'.format(queue, self.queue_class))
+                raise TypeError('{0} is not of type {1} or string types'.format(queue, self.queue_class))
 
     def queue_names(self):
         """Returns the queue names of this worker's queues."""
@@ -337,6 +358,19 @@ class Worker(object):
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
 
+    def kill_horse(self, sig=signal.SIGKILL):
+        """
+        Kill the horse but catch "No such process" error has the horse could already be dead.
+        """
+        try:
+            os.kill(self.horse_pid, sig)
+        except OSError as e:
+            if e.errno == errno.ESRCH:
+                # "No such process" is fine with us
+                self.log.debug('Horse already dead')
+            else:
+                raise
+
     def request_force_stop(self, signum, frame):
         """Terminates the application (cold shutdown).
         """
@@ -346,13 +380,7 @@ class Worker(object):
         if self.horse_pid:
             msg = 'Taking down horse {0} with me'.format(self.horse_pid)
             self.log.debug(msg)
-            try:
-                os.kill(self.horse_pid, signal.SIGKILL)
-            except OSError as e:
-                # ESRCH ("No such process") is fine with us
-                if e.errno != errno.ESRCH:
-                    self.log.debug('Horse already down')
-                    raise
+            self.kill_horse()
         raise SystemExit()
 
     def request_stop(self, signum, frame):
@@ -364,8 +392,7 @@ class Worker(object):
         signal.signal(signal.SIGINT, self.request_force_stop)
         signal.signal(signal.SIGTERM, self.request_force_stop)
 
-        msg = 'Warm shut down requested'
-        self.log.warning(msg)
+        self.handle_warm_shutdown_request()
 
         # If shutdown is requested in the middle of a job, wait until
         # finish before shutting down and save the request in redis
@@ -376,6 +403,9 @@ class Worker(object):
                            'Press Ctrl+C again for a cold shutdown.')
         else:
             raise StopRequested()
+
+    def handle_warm_shutdown_request(self):
+        self.log.warning('Warm shut down requested')
 
     def check_for_suspension(self, burst):
         """Check to see if workers have been suspended by `rq suspend`"""
@@ -400,7 +430,7 @@ class Worker(object):
         if before_state:
             self.set_state(before_state)
 
-    def work(self, burst=False):
+    def work(self, burst=False, logging_level="INFO"):
         """Starts the work loop.
 
         Pops and performs all jobs on the current list of queues.  When all
@@ -409,7 +439,7 @@ class Worker(object):
 
         The return value indicates whether any jobs were processed.
         """
-        setup_loghandlers()
+        setup_loghandlers(logging_level)
         self._install_signal_handlers()
 
         did_perform_work = False
@@ -440,11 +470,8 @@ class Worker(object):
                     break
 
                 job, queue = result
-                self.execute_job(job)
+                self.execute_job(job, queue)
                 self.heartbeat()
-
-                if job.get_status() == JobStatus.FINISHED:
-                    queue.enqueue_dependents(job)
 
                 did_perform_work = True
 
@@ -467,7 +494,8 @@ class Worker(object):
 
             try:
                 result = self.queue_class.dequeue_any(self.queues, timeout,
-                                                      connection=self.connection)
+                                                      connection=self.connection,
+                                                      job_class=self.job_class)
                 if result is not None:
                     job, queue = result
                     self.log.info('{0}: {1} ({2})'.format(green(queue.name),
@@ -497,42 +525,90 @@ class Worker(object):
         self.log.debug('Sent heartbeat to prevent worker timeout. '
                        'Next one should arrive within {0} seconds.'.format(timeout))
 
-    def execute_job(self, job):
+    def fork_work_horse(self, job, queue):
+        """Spawns a work horse to perform the actual work and passes it a job.
+        """
+        child_pid = os.fork()
+        os.environ['RQ_WORKER_ID'] = self.name
+        os.environ['RQ_JOB_ID'] = job.id
+        if child_pid == 0:
+            self.main_work_horse(job, queue)
+        else:
+            self._horse_pid = child_pid
+            self.procline('Forked {0} at {1}'.format(child_pid, time.time()))
+
+    def monitor_work_horse(self, job):
+        """The worker will monitor the work horse and make sure that it
+        either executes successfully or the status of the job is set to
+        failed
+        """
+        while True:
+            try:
+                self._monitor_work_horse_tick(job)
+                break
+            except OSError as e:
+                # In case we encountered an OSError due to EINTR (which is
+                # caused by a SIGINT or SIGTERM signal during
+                # os.waitpid()), we simply ignore it and enter the next
+                # iteration of the loop, waiting for the child to end.  In
+                # any other case, this is some other unexpected OS error,
+                # which we don't want to catch, so we re-raise those ones.
+                if e.errno != errno.EINTR:
+                    raise
+
+    def _monitor_work_horse_tick(self, job):
+        _, ret_val = os.waitpid(self._horse_pid, 0)
+        if ret_val == os.EX_OK:  # The process exited normally.
+            return
+        job_status = job.get_status()
+        if job_status is None:  # Job completed and its ttl has expired
+            return
+        if job_status not in [JobStatus.FINISHED, JobStatus.FAILED]:
+            self.handle_job_failure(job=job)
+
+            # Unhandled failure: move the job to the failed queue
+            self.log.warning((
+                'Moving job to {0!r} queue '
+                '(work-horse terminated unexpectedly; waitpid returned {1})'
+            ).format(self.failed_queue.name, ret_val))
+            self.failed_queue.quarantine(
+                job,
+                exc_info=(
+                    "Work-horse process was terminated unexpectedly "
+                    "(waitpid returned {0})"
+                ).format(ret_val)
+            )
+
+    def execute_job(self, job, queue):
         """Spawns a work horse to perform the actual work and passes it a job.
         The worker will wait for the work horse and make sure it executes
         within the given timeout bounds, or will end the work horse with
         SIGALRM.
         """
         self.set_state('busy')
-        child_pid = os.fork()
-        os.environ['RQ_WORKER_ID'] = self.name
-        os.environ['RQ_JOB_ID'] = job.id
-        if child_pid == 0:
-            self.main_work_horse(job)
-        else:
-            self._horse_pid = child_pid
-            self.procline('Forked {0} at {0}'.format(child_pid, time.time()))
-            while True:
-                try:
-                    os.waitpid(child_pid, 0)
-                    self.set_state('idle')
-                    break
-                except OSError as e:
-                    # In case we encountered an OSError due to EINTR (which is
-                    # caused by a SIGINT or SIGTERM signal during
-                    # os.waitpid()), we simply ignore it and enter the next
-                    # iteration of the loop, waiting for the child to end.  In
-                    # any other case, this is some other unexpected OS error,
-                    # which we don't want to catch, so we re-raise those ones.
-                    if e.errno != errno.EINTR:
-                        raise
+        self.fork_work_horse(job, queue)
+        self.monitor_work_horse(job)
+        self.set_state('idle')
 
-    def main_work_horse(self, job):
+    def main_work_horse(self, job, queue):
         """This is the entry point of the newly spawned work horse."""
         # After fork()'ing, always assure we are generating random sequences
         # that are different from the worker.
         random.seed()
 
+        self.setup_work_horse_signals()
+
+        self._is_horse = True
+        self.log = logger
+
+        success = self.perform_job(job, queue)
+
+        # os._exit() is the way to exit from childs after a fork(), in
+        # constrast to the regular sys.exit()
+        os._exit(int(not success))
+
+    def setup_work_horse_signals(self):
+        """Setup signal handing for the newly spawned work horse."""
         # Always ignore Ctrl+C in the work horse, as it might abort the
         # currently running job.
         # The main worker catches the Ctrl+C and requests graceful shutdown
@@ -540,15 +616,6 @@ class Worker(object):
         # kills the current job anyway.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
-
-        self._is_horse = True
-        self.log = logger
-
-        success = self.perform_job(job)
-
-        # os._exit() is the way to exit from childs after a fork(), in
-        # constrast to the regular sys.exit()
-        os._exit(int(not success))
 
     def prepare_job_execution(self, job):
         """Performs misc bookkeeping like updating states prior to
@@ -560,7 +627,9 @@ class Worker(object):
             self.set_state(WorkerStatus.BUSY, pipeline=pipeline)
             self.set_current_job_id(job.id, pipeline=pipeline)
             self.heartbeat(timeout, pipeline=pipeline)
-            registry = StartedJobRegistry(job.origin, self.connection)
+            registry = StartedJobRegistry(job.origin,
+                                          self.connection,
+                                          job_class=self.job_class)
             registry.add(job, timeout, pipeline=pipeline)
             job.set_status(JobStatus.STARTED, pipeline=pipeline)
             self.connection._hset(job.key, 'started_at',
@@ -570,57 +639,100 @@ class Worker(object):
         msg = 'Processing {0} from {1} since {2}'
         self.procline(msg.format(job.func_name, job.origin, time.time()))
 
-    def perform_job(self, job):
+    def handle_job_failure(self, job, started_job_registry=None):
+        """Handles the failure or an executing job by:
+            1. Setting the job status to failed
+            2. Removing the job from the started_job_registry
+            3. Setting the workers current job to None
+        """
+
+        with self.connection._pipeline() as pipeline:
+            if started_job_registry is None:
+                started_job_registry = StartedJobRegistry(job.origin,
+                                                          self.connection,
+                                                          job_class=self.job_class)
+            job.set_status(JobStatus.FAILED, pipeline=pipeline)
+            started_job_registry.remove(job, pipeline=pipeline)
+            self.set_current_job_id(None, pipeline=pipeline)
+            try:
+                pipeline.execute()
+            except Exception:
+                # Ensure that custom exception handlers are called
+                # even if Redis is down
+                pass
+
+    def handle_job_success(self, job, queue, started_job_registry):
+        with self.connection._pipeline() as pipeline:
+            while True:
+                try:
+                    # if dependencies are inserted after enqueue_dependents
+                    # a WatchError is thrown by execute()
+                    pipeline.watch(job.dependents_key)
+                    # enqueue_dependents calls multi() on the pipeline!
+                    queue.enqueue_dependents(job, pipeline=pipeline)
+
+                    self.set_current_job_id(None, pipeline=pipeline)
+
+                    result_ttl = job.get_result_ttl(self.default_result_ttl)
+                    if result_ttl != 0:
+                        job.set_status(JobStatus.FINISHED, pipeline=pipeline)
+                        # Don't clobber the user's meta dictionary!
+                        job.save(pipeline=pipeline, include_meta=False)
+
+                        finished_job_registry = FinishedJobRegistry(job.origin,
+                                                                    self.connection,
+                                                                    job_class=self.job_class)
+                        finished_job_registry.add(job, result_ttl, pipeline)
+
+                    job.cleanup(result_ttl, pipeline=pipeline,
+                                remove_from_queue=False)
+                    started_job_registry.remove(job, pipeline=pipeline)
+
+                    pipeline.execute()
+                    break
+                except WatchError:
+                    continue
+
+    def perform_job(self, job, queue):
         """Performs the actual work of a job.  Will/should only be called
         inside the work horse's process.
         """
         self.prepare_job_execution(job)
 
-        with self.connection._pipeline() as pipeline:
-            started_job_registry = StartedJobRegistry(job.origin, self.connection)
+        push_connection(self.connection)
 
-            try:
-                with self.death_penalty_class(job.timeout or self.queue_class.DEFAULT_TIMEOUT):
-                    rv = job.perform()
+        started_job_registry = StartedJobRegistry(job.origin,
+                                                  self.connection,
+                                                  job_class=self.job_class)
 
-                # Pickle the result in the same try-except block since we need
-                # to use the same exc handling when pickling fails
-                job._result = rv
+        try:
+            with self.death_penalty_class(job.timeout or self.queue_class.DEFAULT_TIMEOUT):
+                rv = job.perform()
 
-                self.set_current_job_id(None, pipeline=pipeline)
+            job.ended_at = utcnow()
 
-                result_ttl = job.get_result_ttl(self.default_result_ttl)
-                if result_ttl != 0:
-                    job.ended_at = utcnow()
-                    job._status = JobStatus.FINISHED
-                    job.save(pipeline=pipeline)
+            # Pickle the result in the same try-except block since we need
+            # to use the same exc handling when pickling fails
+            job._result = rv
 
-                    finished_job_registry = FinishedJobRegistry(job.origin, self.connection)
-                    finished_job_registry.add(job, result_ttl, pipeline)
+            self.handle_job_success(job=job,
+                                    queue=queue,
+                                    started_job_registry=started_job_registry)
+        except Exception:
+            self.handle_job_failure(job=job,
+                                    started_job_registry=started_job_registry)
+            self.handle_exception(job, *sys.exc_info())
+            return False
 
-                job.cleanup(result_ttl, pipeline=pipeline)
-                started_job_registry.remove(job, pipeline=pipeline)
-
-                pipeline.execute()
-
-            except Exception:
-                job.set_status(JobStatus.FAILED, pipeline=pipeline)
-                started_job_registry.remove(job, pipeline=pipeline)
-                self.set_current_job_id(None, pipeline=pipeline)
-                try:
-                    pipeline.execute()
-                except Exception:
-                    # Ensure that custom exception handlers are called
-                    # even if Redis is down
-                    pass
-                self.handle_exception(job, *sys.exc_info())
-                return False
+        finally:
+            pop_connection()
 
         self.log.info('{0}: {1} ({2})'.format(green(job.origin), blue('Job OK'), job.id))
-        if rv:
+        if rv is not None:
             log_result = "{0!r}".format(as_text(text_type(rv)))
             self.log.debug('Result: {0}'.format(yellow(log_result)))
 
+        result_ttl = job.get_result_ttl(self.default_result_ttl)
         if result_ttl == 0:
             self.log.info('Result discarded immediately')
         elif result_ttl > 0:
@@ -632,8 +744,9 @@ class Worker(object):
 
     def handle_exception(self, job, *exc_info):
         """Walks the exception handler stack to delegate exception handling."""
-        exc_string = ''.join(traceback.format_exception_only(*exc_info[:2]) +
-                             traceback.format_exception(*exc_info))
+        exc_string = self._get_safe_exception_string(
+            traceback.format_exception_only(*exc_info[:2]) + traceback.format_exception(*exc_info)
+        )
         self.log.error(exc_string, exc_info=True, extra={
             'func': job.func_name,
             'arguments': job.args,
@@ -655,9 +768,15 @@ class Worker(object):
 
     def move_to_failed_queue(self, job, *exc_info):
         """Default exception handler: move the job to the failed queue."""
-        exc_string = ''.join(traceback.format_exception(*exc_info))
+        exc_string = self._get_safe_exception_string(traceback.format_exception(*exc_info))
         self.log.warning('Moving job to {0!r} queue'.format(self.failed_queue.name))
         self.failed_queue.quarantine(job, exc_info=exc_string)
+
+    def _get_safe_exception_string(self, exc_strings):
+        """Ensure list of exception strings is decoded on Python 2 and joined as one string safely."""
+        if sys.version_info[0] < 3:
+            exc_strings = [exc.decode("utf-8") for exc in exc_strings]
+        return ''.join(exc_strings)
 
     def push_exc_handler(self, handler_func):
         """Pushes an exception handler onto the exc handler stack."""
@@ -701,3 +820,49 @@ class SimpleWorker(Worker):
     def execute_job(self, *args, **kwargs):
         """Execute job in same thread/process, do not fork()"""
         return self.perform_job(*args, **kwargs)
+
+
+class HerokuWorker(Worker):
+    """
+    Modified version of rq worker which:
+    * stops work horses getting killed with SIGTERM
+    * sends SIGRTMIN to work horses on SIGTERM to the main process which in turn
+    causes the horse to crash `imminent_shutdown_delay` seconds later
+    """
+    imminent_shutdown_delay = 6
+
+    frame_properties = ['f_code', 'f_lasti', 'f_lineno', 'f_locals', 'f_trace']
+    if PY2:
+        frame_properties.extend(
+            ['f_exc_traceback', 'f_exc_type', 'f_exc_value', 'f_restricted']
+        )
+
+    def setup_work_horse_signals(self):
+        """Modified to ignore SIGINT and SIGTERM and only handle SIGRTMIN"""
+        signal.signal(signal.SIGRTMIN, self.request_stop_sigrtmin)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+    def handle_warm_shutdown_request(self):
+        """If horse is alive send it SIGRTMIN"""
+        if self.horse_pid != 0:
+            self.log.warning('Warm shut down requested, sending horse SIGRTMIN signal')
+            self.kill_horse(sig=signal.SIGRTMIN)
+        else:
+            self.log.warning('Warm shut down requested, no horse found')
+
+    def request_stop_sigrtmin(self, signum, frame):
+        if self.imminent_shutdown_delay == 0:
+            self.log.warning('Imminent shutdown, raising ShutDownImminentException immediately')
+            self.request_force_stop_sigrtmin(signum, frame)
+        else:
+            self.log.warning('Imminent shutdown, raising ShutDownImminentException in %d seconds',
+                             self.imminent_shutdown_delay)
+            signal.signal(signal.SIGRTMIN, self.request_force_stop_sigrtmin)
+            signal.signal(signal.SIGALRM, self.request_force_stop_sigrtmin)
+            signal.alarm(self.imminent_shutdown_delay)
+
+    def request_force_stop_sigrtmin(self, signum, frame):
+        info = dict((attr, getattr(frame, attr)) for attr in self.frame_properties)
+        self.log.warning('raising ShutDownImminentException to cancel job...')
+        raise ShutDownImminentException('shut down imminent (signal: %s)' % signal_name(signum), info)

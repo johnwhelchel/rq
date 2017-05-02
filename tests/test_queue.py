@@ -7,7 +7,7 @@ from tests.fixtures import (div_by_zero, echo, Number, say_hello,
                             some_calculation)
 
 from rq import get_failed_queue, Queue
-from rq.exceptions import InvalidJobOperationError
+from rq.exceptions import InvalidJobDependency, InvalidJobOperationError
 from rq.job import Job, JobStatus
 from rq.registry import DeferredJobRegistry
 from rq.worker import Worker
@@ -22,6 +22,7 @@ class TestQueue(RQTestCase):
         """Creating queues."""
         q = Queue('my-queue')
         self.assertEqual(q.name, 'my-queue')
+        self.assertEqual(str(q), '<Queue my-queue>')
 
     def test_create_default_queue(self):
         """Instantiating the default queue."""
@@ -38,6 +39,9 @@ class TestQueue(RQTestCase):
         self.assertEqual(q2, q1)
         self.assertNotEqual(q1, q3)
         self.assertNotEqual(q2, q3)
+        self.assertGreater(q1, q3)
+        self.assertRaises(TypeError, lambda: q1 == 'some string')
+        self.assertRaises(TypeError, lambda: q1 < 'some string')
 
     def test_empty_queue(self):
         """Emptying queues."""
@@ -241,15 +245,19 @@ class TestQueue(RQTestCase):
         self.assertEqual(queue, fooq)
         self.assertEqual(job.func, say_hello)
         self.assertEqual(job.origin, fooq.name)
-        self.assertEqual(job.args[0], 'for Foo',
-                          'Foo should be dequeued first.')
+        self.assertEqual(
+            job.args[0], 'for Foo',
+            'Foo should be dequeued first.'
+        )
 
         job, queue = Queue.dequeue_any([fooq, barq], None)
         self.assertEqual(queue, barq)
         self.assertEqual(job.func, say_hello)
         self.assertEqual(job.origin, barq.name)
-        self.assertEqual(job.args[0], 'for Bar',
-                          'Bar should be dequeued second.')
+        self.assertEqual(
+            job.args[0], 'for Bar',
+            'Bar should be dequeued second.'
+        )
 
     def test_dequeue_any_ignores_nonexisting_jobs(self):
         """Dequeuing (from any queue) silently ignores non-existing jobs."""
@@ -260,8 +268,10 @@ class TestQueue(RQTestCase):
 
         # Dequeue simply ignores the missing job and returns None
         self.assertEqual(q.count, 1)
-        self.assertEqual(Queue.dequeue_any([Queue(), Queue('low')], None),  # noqa
-                None)
+        self.assertEqual(
+            Queue.dequeue_any([Queue(), Queue('low')], None),  # noqa
+            None
+        )
         self.assertEqual(q.count, 0)
 
     def test_enqueue_sets_status(self):
@@ -332,6 +342,28 @@ class TestQueue(RQTestCase):
         # Queue.all() should still report the empty queues
         self.assertEqual(len(Queue.all()), 3)
 
+    def test_all_custom_job(self):
+        class CustomJob(Job):
+            pass
+
+        q = Queue('all-queue')
+        q.enqueue(say_hello)
+        queues = Queue.all(job_class=CustomJob)
+        self.assertEqual(len(queues), 1)
+        self.assertIs(queues[0].job_class, CustomJob)
+
+    def test_from_queue_key(self):
+        """Ensure being able to get a Queue instance manually from Redis"""
+        q = Queue()
+        key = Queue.redis_queue_namespace_prefix + 'default'
+        reverse_q = Queue.from_queue_key(key)
+        self.assertEqual(q, reverse_q)
+
+    def test_from_queue_key_error(self):
+        """Ensure that an exception is raised if the queue prefix is wrong"""
+        key = 'some:weird:prefix:' + 'default'
+        self.assertRaises(ValueError, Queue.from_queue_key, key)
+
     def test_enqueue_dependents(self):
         """Enqueueing dependent jobs pushes all jobs in the depends set to the queue
         and removes them from DeferredJobQueue."""
@@ -354,7 +386,6 @@ class TestQueue(RQTestCase):
 
         # DeferredJobRegistry should also be empty
         self.assertEqual(registry.get_job_ids(), [])
-
 
     def test_enqueue_dependents_on_multiple_queues(self):
         """Enqueueing dependent jobs on multiple queues pushes jobs in the queues
@@ -392,12 +423,11 @@ class TestQueue(RQTestCase):
         self.assertEqual(registry_1.get_job_ids(), [])
         self.assertEqual(registry_2.get_job_ids(), [])
 
-
-
     def test_enqueue_job_with_dependency(self):
         """Jobs are enqueued only when their dependencies are finished."""
         # Job with unfinished dependency is not immediately enqueued
         parent_job = Job.create(func=say_hello)
+        parent_job.save()
         q = Queue()
         job = q.enqueue_call(say_hello, depends_on=parent_job)
         self.assertEqual(q.job_ids, [])
@@ -412,8 +442,9 @@ class TestQueue(RQTestCase):
         self.assertEqual(job.get_status(), JobStatus.QUEUED)
 
     def test_enqueue_job_with_dependency_by_id(self):
-        """"Can specify job dependency with job object or job id."""
+        """Can specify job dependency with job object or job id."""
         parent_job = Job.create(func=say_hello)
+        parent_job.save()
 
         q = Queue()
         q.enqueue_call(say_hello, depends_on=parent_job.id)
@@ -430,6 +461,7 @@ class TestQueue(RQTestCase):
         """Jobs remember their timeout when enqueued as a dependency."""
         # Job with unfinished dependency is not immediately enqueued
         parent_job = Job.create(func=say_hello)
+        parent_job.save()
         q = Queue()
         job = q.enqueue_call(say_hello, depends_on=parent_job, timeout=123)
         self.assertEqual(q.job_ids, [])
@@ -442,8 +474,58 @@ class TestQueue(RQTestCase):
         self.assertEqual(q.job_ids, [job.id])
         self.assertEqual(job.timeout, 123)
 
+    def test_enqueue_job_with_invalid_dependency(self):
+        """Enqueuing a job fails, if the dependency does not exist at all."""
+        parent_job = Job.create(func=say_hello)
+        # without save() the job is not visible to others
+
+        q = Queue()
+        with self.assertRaises(InvalidJobDependency):
+            q.enqueue_call(say_hello, depends_on=parent_job)
+
+        with self.assertRaises(InvalidJobDependency):
+            q.enqueue_call(say_hello, depends_on=parent_job.id)
+
+        self.assertEqual(q.job_ids, [])
+
+    def test_fetch_job_successful(self):
+        """Fetch a job from a queue."""
+        q = Queue('example')
+        job_orig = q.enqueue(say_hello)
+        job_fetch = q.fetch_job(job_orig.id)
+        self.assertIsNotNone(job_fetch)
+        self.assertEqual(job_orig.id, job_fetch.id)
+        self.assertEqual(job_orig.description, job_fetch.description)
+
+    def test_fetch_job_missing(self):
+        """Fetch a job from a queue which doesn't exist."""
+        q = Queue('example')
+        job = q.fetch_job('123')
+        self.assertIsNone(job)
+
+    def test_fetch_job_different_queue(self):
+        """Fetch a job from a queue which is in a different queue."""
+        q1 = Queue('example1')
+        q2 = Queue('example2')
+        job_orig = q1.enqueue(say_hello)
+        job_fetch = q2.fetch_job(job_orig.id)
+        self.assertIsNone(job_fetch)
+
+        job_fetch = q1.fetch_job(job_orig.id)
+        self.assertIsNotNone(job_fetch)
+
 
 class TestFailedQueue(RQTestCase):
+    def test_get_failed_queue(self):
+        """Use custom job class"""
+        class CustomJob(Job):
+            pass
+        failed_queue = get_failed_queue(job_class=CustomJob)
+        self.assertIs(failed_queue.job_class, CustomJob)
+
+        failed_queue = get_failed_queue(job_class='rq.job.Job')
+        self.assertIsNot(failed_queue.job_class, CustomJob)
+
     def test_requeue_job(self):
         """Requeueing existing jobs."""
         job = Job.create(func=div_by_zero, args=(1, 2, 3))
@@ -454,10 +536,32 @@ class TestFailedQueue(RQTestCase):
         self.assertEqual(Queue.all(), [get_failed_queue()])  # noqa
         self.assertEqual(get_failed_queue().count, 1)
 
-        get_failed_queue().requeue(job.id)
+        requeued_job = get_failed_queue().requeue(job.id)
 
         self.assertEqual(get_failed_queue().count, 0)
         self.assertEqual(Queue('fake').count, 1)
+        self.assertEqual(requeued_job.origin, job.origin)
+
+    def test_get_job_on_failed_queue(self):
+        default_queue = Queue()
+        failed_queue = get_failed_queue()
+
+        job = default_queue.enqueue(div_by_zero, args=(1, 2, 3))
+
+        job_on_default_queue = default_queue.fetch_job(job.id)
+        job_on_failed_queue = failed_queue.fetch_job(job.id)
+
+        self.assertIsNotNone(job_on_default_queue)
+        self.assertIsNone(job_on_failed_queue)
+
+        job.set_status(JobStatus.FAILED)
+
+        job_on_default_queue = default_queue.fetch_job(job.id)
+        job_on_failed_queue = failed_queue.fetch_job(job.id)
+
+        self.assertIsNotNone(job_on_default_queue)
+        self.assertIsNotNone(job_on_failed_queue)
+        self.assertTrue(job_on_default_queue.is_failed)
 
     def test_requeue_nonfailed_job_fails(self):
         """Requeueing non-failed jobs raises error."""
@@ -529,3 +633,20 @@ class TestFailedQueue(RQTestCase):
         skip_job = q.enqueue(say_hello, at_front=True)
         assert q.dequeue() == skip_job
         assert q.dequeue() == job2
+
+    def test_job_deletion(self):
+        """Ensure job.delete() removes itself from FailedQueue."""
+        job = Job.create(func=div_by_zero, args=(1, 2, 3))
+        job.origin = 'fake'
+        job.timeout = 200
+        job.save()
+
+        job.set_status(JobStatus.FAILED)
+
+        failed_queue = get_failed_queue()
+        failed_queue.quarantine(job, Exception('Some fake error'))
+
+        self.assertTrue(job.id in failed_queue.get_job_ids())
+
+        job.delete()
+        self.assertFalse(job.id in failed_queue.get_job_ids())
