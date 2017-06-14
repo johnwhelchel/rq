@@ -140,7 +140,7 @@ class Worker(object):
 
     def __init__(self, queues, name=None, default_result_ttl=None, connection=None,
                  exc_handler=None, exception_handlers=None, default_worker_ttl=None,
-                 job_class=None, queue_class=None):  # noqa
+                 job_class=None, queue_class=None, suffix=None):  # noqa
         if connection is None:
             connection = get_current_connection()
         self.connection = connection
@@ -154,6 +154,7 @@ class Worker(object):
                   if isinstance(q, string_types) else q
                   for q in ensure_list(queues)]
         self._name = name
+        self._suffix = suffix
         self.queues = queues
         self.validate_queues()
         self._exc_handlers = []
@@ -211,12 +212,16 @@ class Worker(object):
         monitoring system.
 
         By default, the name of the worker is constructed from the current
-        (short) host name and the current PID.
+        (short) host name and the current PID as well as a suffix if provided.
         """
         if self._name is None:
             hostname = socket.gethostname()
             shortname, _, _ = hostname.partition('.')
             self._name = '{0}.{1}'.format(shortname, self.pid)
+
+            if self._suffix is not None:
+                self._name += '.{}'.format(self._suffix)
+
         return self._name
 
     @property
@@ -464,13 +469,13 @@ class Worker(object):
                         if burst:
                             self.log.info("RQ worker {0!r} done, quitting".format(self.key))
                         break
-                        
+
                     job, queue = result
                     self.execute_job(job, queue)
                     self.heartbeat()
-                    
+
                     did_perform_work = True
-                    
+
                 except StopRequested:
                     break
         finally:
