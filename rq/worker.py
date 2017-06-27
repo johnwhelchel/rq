@@ -718,6 +718,9 @@ class Worker(object):
             # to use the same exc handling when pickling fails
             job._result = rv
 
+            if job.get_status() in [None, JobStatus.CANCELED]:
+                job.on_cancel_request()
+
             self.handle_job_success(job=job,
                                     queue=queue,
                                     started_job_registry=started_job_registry)

@@ -183,7 +183,8 @@ class Queue(object):
 
     def enqueue_call(self, func, args=None, kwargs=None, timeout=None,
                      result_ttl=None, ttl=None, description=None,
-                     depends_on=None, job_id=None, at_front=False, meta=None):
+                     depends_on=None, job_id=None, at_front=False, meta=None,
+                     on_cancel=None):
         """Creates a job to represent the delayed function call and enqueues
         it.
 
@@ -199,31 +200,37 @@ class Queue(object):
             func, args=args, kwargs=kwargs, connection=self.connection,
             result_ttl=result_ttl, ttl=ttl, status=JobStatus.QUEUED,
             description=description, depends_on=depends_on,
-            timeout=timeout, id=job_id, origin=self.name, meta=meta)
+            timeout=timeout, id=job_id, origin=self.name, meta=meta,
+            on_cancel=on_cancel)
 
         # If job depends on an unfinished job, register itself on it's
         # parent's dependents instead of enqueueing it.
         # If WatchError is raised in the process, that means something else is
         # modifying the dependency. In this case we simply retry
-        if depends_on is not None:
-            if not isinstance(depends_on, self.job_class):
-                depends_on = self.job_class(id=depends_on,
-                                            connection=self.connection)
+        if depends_on:
+            if not isinstance(depends_on, list):
+                if not isinstance(depends_on, self.job_class):
+                    depends_on = Job(id=depends_on, connection=self.connection)
+
+                dependencies = [depends_on]
+            else:
+                dependencies = depends_on
+
+            remaining_dependencies = []
             with self.connection._pipeline() as pipe:
                 while True:
                     try:
-                        pipe.watch(depends_on.key)
+                        pipe.watch(*[dependency.key for dependency in dependencies])
 
-                        # If the dependency does not exist, raise an
-                        # exception to avoid creating an orphaned job.
-                        if not self.job_class.exists(depends_on.id,
-                                                     self.connection):
-                            raise InvalidJobDependency('Job {0} does not exist'.format(depends_on.id))
+                        for dependency in dependencies:
+                            if dependency.get_status() != JobStatus.FINISHED:
+                                remaining_dependencies.append(dependency)
 
-                        if depends_on.get_status() != JobStatus.FINISHED:
+                        if remaining_dependencies:
                             pipe.multi()
                             job.set_status(JobStatus.DEFERRED)
-                            job.register_dependency(pipeline=pipe)
+                            job.register_dependencies(remaining_dependencies,
+                                                      pipeline=pipe)
                             job.save(pipeline=pipe)
                             pipe.execute()
                             return job
@@ -270,6 +277,7 @@ class Queue(object):
         job_id = kwargs.pop('job_id', None)
         at_front = kwargs.pop('at_front', False)
         meta = kwargs.pop('meta', None)
+        on_cancel = kwargs.pop('on_cancel', None)
 
         if 'args' in kwargs or 'kwargs' in kwargs:
             assert args == (), 'Extra positional arguments cannot be used when using explicit args and kwargs'  # noqa
@@ -279,7 +287,8 @@ class Queue(object):
         return self.enqueue_call(func=f, args=args, kwargs=kwargs,
                                  timeout=timeout, result_ttl=result_ttl, ttl=ttl,
                                  description=description, depends_on=depends_on,
-                                 job_id=job_id, at_front=at_front, meta=meta)
+                                 job_id=job_id, at_front=at_front, meta=meta,
+                                 on_cancel=on_cancel)
 
     def enqueue_job(self, job, pipeline=None, at_front=False):
         """Enqueues a job for delayed execution.
@@ -351,14 +360,19 @@ class Queue(object):
                     pipe.execute()
 
                 break
-            except WatchError:
-                if pipeline is None:
-                    continue
-                else:
-                    # if the pipeline comes from the caller, we re-raise the
-                    # exception as it it the responsibility of the caller to
-                    # handle it
-                    raise
+            dependent = self.job_class.fetch(job_id, connection=self.connection)
+            registry = DeferredJobRegistry(dependent.origin, self.connection)
+            with self.connection._pipeline() as pipeline:
+                dependent.remove_dependency(job.id)
+                if not dependent.has_unmet_dependencies():
+                    if dependent.origin == self.name:
+                        self.enqueue_job(dependent, pipeline=pipeline)
+                    else:
+                        queue = Queue(name=dependent.origin,
+                                      connection=self.connection)
+                        queue.enqueue_job(dependent, pipeline=pipeline)
+                    registry.remove(dependent, pipeline=pipeline)
+                pipeline.execute()
 
     def pop_job_id(self):
         """Pops a given job ID from this Redis queue."""
