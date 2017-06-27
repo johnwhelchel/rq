@@ -464,6 +464,7 @@ class Worker(object):
 
                     timeout = None if burst else max(1, self.default_worker_ttl - 60)
 
+                    print('CHECKING FOR NEW JOB')
                     result = self.dequeue_job_and_maintain_ttl(timeout)
                     if result is None:
                         if burst:
@@ -475,6 +476,7 @@ class Worker(object):
                     self.heartbeat()
 
                     did_perform_work = True
+                    print("END OF MY CYLCE")
 
                 except StopRequested:
                     break
@@ -673,6 +675,8 @@ class Worker(object):
                     pipeline.watch(job.dependents_key)
                     # enqueue_dependents calls multi() on the pipeline!
                     queue.enqueue_dependents(job, pipeline=pipeline)
+
+                    print('DONE ENQUEING DEPENDENDENTS')
 
                     self.set_current_job_id(None, pipeline=pipeline)
 

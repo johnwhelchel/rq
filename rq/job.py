@@ -217,6 +217,7 @@ class Job(object):
 
     def has_unmet_dependencies(self):
         """Checks whether job has dependencies that aren't yet finished."""
+        print('UNMET', self.connection.smembers(self.dependencies_key))
         return bool(self.connection.scard(self.dependencies_key))
 
     @property
@@ -388,7 +389,11 @@ class Job(object):
     @classmethod
     def key_for(cls, job_id):
         """The Redis key that is used to store job hash under."""
-        return b'rq:job:' + job_id.encode('utf-8')
+        try:
+            return b'rq:job:' + job_id.encode('utf-8')
+        except:
+            # HACK: Chris: I added this during jlopex multi merge
+            return b'rq:job:' + job_id
 
     @classmethod
     def dependents_key_for(cls, job_id):
@@ -587,7 +592,7 @@ class Job(object):
         self.connection.delete(self.dependencies_key)
         self.connection.expire(self.key, 2)
 
-    def delete(self, pipeline=None):
+    def delete(self, pipeline=None, remove_from_queue=True):
         """Cancels the job and deletes the job hash from Redis."""
         if remove_from_queue:
             self.cancel()

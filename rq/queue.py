@@ -320,59 +320,45 @@ class Queue(object):
         return job
 
     def enqueue_dependents(self, job, pipeline=None):
-        """Enqueues all jobs in the given job's dependents set and clears it.
-
-        When called without a pipeline, this method uses WATCH/MULTI/EXEC.
-        If you pass a pipeline, only MULTI is called. The rest is up to the
-        caller.
-        """
+        """Enqueues all jobs in the given job's dependents set and clears it."""
         from .registry import DeferredJobRegistry
 
         pipe = pipeline if pipeline is not None else self.connection._pipeline()
-        dependents_key = job.dependents_key
 
         while True:
             try:
-                # if a pipeline is passed, the caller is responsible for calling WATCH
-                # to ensure all jobs are enqueued
-                if pipeline is None:
-                    pipe.watch(dependents_key)
+                job_id = as_text(self.connection.spop(job.dependents_key))
+                print('NEXT JOB', job_id)
+                if job_id is None:
+                    break
+                dependent = self.job_class.fetch(job_id, connection=self.connection)
+                registry = DeferredJobRegistry(dependent.origin, self.connection)
 
-                dependent_jobs = [self.job_class.fetch(as_text(job_id), connection=self.connection)
-                                  for job_id in pipe.smembers(dependents_key)]
-
-                pipe.multi()
-
-                for dependent in dependent_jobs:
-                    registry = DeferredJobRegistry(dependent.origin,
-                                                   self.connection,
-                                                   job_class=self.job_class)
-                    registry.remove(dependent, pipeline=pipe)
+                dependent.remove_dependency(job.id)
+                if not dependent.has_unmet_dependencies():
                     if dependent.origin == self.name:
-                        self.enqueue_job(dependent, pipeline=pipe)
+                        print('ENQUEING on ME')
+                        self.enqueue_job(dependent, pipeline=pipeline)
                     else:
-                        queue = Queue(name=dependent.origin, connection=self.connection)
-                        queue.enqueue_job(dependent, pipeline=pipe)
-
-                pipe.delete(dependents_key)
+                        print('ENQUEING on', dependent.origin)
+                        queue = Queue(name=dependent.origin,
+                                      connection=self.connection)
+                        queue.enqueue_job(dependent, pipeline=pipeline)
+                    registry.remove(dependent, pipeline=pipeline)
 
                 if pipeline is None:
                     pipe.execute()
 
                 break
-            dependent = self.job_class.fetch(job_id, connection=self.connection)
-            registry = DeferredJobRegistry(dependent.origin, self.connection)
-            with self.connection._pipeline() as pipeline:
-                dependent.remove_dependency(job.id)
-                if not dependent.has_unmet_dependencies():
-                    if dependent.origin == self.name:
-                        self.enqueue_job(dependent, pipeline=pipeline)
-                    else:
-                        queue = Queue(name=dependent.origin,
-                                      connection=self.connection)
-                        queue.enqueue_job(dependent, pipeline=pipeline)
-                    registry.remove(dependent, pipeline=pipeline)
-                pipeline.execute()
+
+            except WatchError:
+                if pipeline is None:
+                    continue
+                else:
+                    # if the pipeline comes from the caller, we re-raise the
+                    # exception as it it the responsibility of the caller to
+                    # handle it
+                    raise
 
     def pop_job_id(self):
         """Pops a given job ID from this Redis queue."""
@@ -446,7 +432,11 @@ class Queue(object):
 
         while True:
             queue_keys = [q.key for q in queues]
+            print('CHECKING FOR JOB ONS QUUES', queue_keys)
+            for k in queue_keys:
+                print('MEMBERS', connection.lrange(k, 0, 100))
             result = cls.lpop(queue_keys, timeout, connection=connection)
+            print('GOT', result)
             if result is None:
                 return None
             queue_key, job_id = map(as_text, result)
