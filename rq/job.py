@@ -217,7 +217,6 @@ class Job(object):
 
     def has_unmet_dependencies(self):
         """Checks whether job has dependencies that aren't yet finished."""
-        print('UNMET', self.connection.smembers(self.dependencies_key))
         return bool(self.connection.scard(self.dependencies_key))
 
     @property

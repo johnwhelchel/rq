@@ -327,24 +327,22 @@ class Queue(object):
 
         while True:
             try:
-                job_id = as_text(self.connection.spop(job.dependents_key))
-                print('NEXT JOB', job_id)
-                if job_id is None:
+                job_ids = self.connection.smembers(job.dependents_key)
+                if len(job_ids) == 0:
                     break
-                dependent = self.job_class.fetch(job_id, connection=self.connection)
-                registry = DeferredJobRegistry(dependent.origin, self.connection)
+                for job_id in job_ids:
+                    dependent = self.job_class.fetch(job_id, connection=self.connection)
+                    registry = DeferredJobRegistry(dependent.origin, self.connection)
 
-                dependent.remove_dependency(job.id)
-                if not dependent.has_unmet_dependencies():
-                    if dependent.origin == self.name:
-                        print('ENQUEING on ME')
-                        self.enqueue_job(dependent, pipeline=pipeline)
-                    else:
-                        print('ENQUEING on', dependent.origin)
-                        queue = Queue(name=dependent.origin,
-                                      connection=self.connection)
-                        queue.enqueue_job(dependent, pipeline=pipeline)
-                    registry.remove(dependent, pipeline=pipeline)
+                    dependent.remove_dependency(job.id)
+                    if not dependent.has_unmet_dependencies():
+                        if dependent.origin == self.name:
+                            self.enqueue_job(dependent, pipeline=pipeline)
+                        else:
+                            queue = Queue(name=dependent.origin,
+                                          connection=self.connection)
+                            queue.enqueue_job(dependent, pipeline=pipeline)
+                        registry.remove(dependent, pipeline=pipeline)
 
                 if pipeline is None:
                     pipe.execute()
@@ -432,11 +430,7 @@ class Queue(object):
 
         while True:
             queue_keys = [q.key for q in queues]
-            print('CHECKING FOR JOB ONS QUUES', queue_keys)
-            for k in queue_keys:
-                print('MEMBERS', connection.lrange(k, 0, 100))
             result = cls.lpop(queue_keys, timeout, connection=connection)
-            print('GOT', result)
             if result is None:
                 return None
             queue_key, job_id = map(as_text, result)
