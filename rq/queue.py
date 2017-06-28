@@ -343,17 +343,19 @@ class Queue(object):
                 pipe.multi()
 
                 for dependent in dependent_jobs:
-                    registry = DeferredJobRegistry(dependent.origin,
-                                                   self.connection,
-                                                   job_class=self.job_class)
-                    registry.remove(dependent, pipeline=pipe)
-                    if dependent.origin == self.name:
-                        self.enqueue_job(dependent, pipeline=pipe)
-                    else:
-                        queue = Queue(name=dependent.origin, connection=self.connection)
-                        queue.enqueue_job(dependent, pipeline=pipe)
+                    dependent.remove_dependency(job.id)
+                    if dependent.has_unmet_dependencies() is False:  # Added by chris
+                        registry = DeferredJobRegistry(dependent.origin,
+                                                       self.connection,
+                                                       job_class=self.job_class)
+                        registry.remove(dependent, pipeline=pipe)
+                        if dependent.origin == self.name:
+                            self.enqueue_job(dependent, pipeline=pipe)
+                        else:
+                            queue = Queue(name=dependent.origin, connection=self.connection)
+                            queue.enqueue_job(dependent, pipeline=pipe)
 
-                pipe.delete(dependents_key)
+                # FROM RQ pipe.delete(dependents_key)
 
                 if pipeline is None:
                     pipe.execute()
