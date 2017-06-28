@@ -320,35 +320,45 @@ class Queue(object):
         return job
 
     def enqueue_dependents(self, job, pipeline=None):
-        """Enqueues all jobs in the given job's dependents set and clears it."""
+        """Enqueues all jobs in the given job's dependents set and clears it.
+        When called without a pipeline, this method uses WATCH/MULTI/EXEC.
+        If you pass a pipeline, only MULTI is called. The rest is up to the
+        caller.
+        """
         from .registry import DeferredJobRegistry
 
         pipe = pipeline if pipeline is not None else self.connection._pipeline()
+        dependents_key = job.dependents_key
 
         while True:
             try:
-                job_ids = self.connection.smembers(job.dependents_key)
-                if len(job_ids) == 0:
-                    break
-                for job_id in job_ids:
-                    dependent = self.job_class.fetch(job_id, connection=self.connection)
-                    registry = DeferredJobRegistry(dependent.origin, self.connection)
+                # if a pipeline is passed, the caller is responsible for calling WATCH
+                # to ensure all jobs are enqueued
+                if pipeline is None:
+                    pipe.watch(dependents_key)
 
-                    dependent.remove_dependency(job.id)
-                    if not dependent.has_unmet_dependencies():
-                        if dependent.origin == self.name:
-                            self.enqueue_job(dependent, pipeline=pipeline)
-                        else:
-                            queue = Queue(name=dependent.origin,
-                                          connection=self.connection)
-                            queue.enqueue_job(dependent, pipeline=pipeline)
-                        registry.remove(dependent, pipeline=pipeline)
+                dependent_jobs = [self.job_class.fetch(as_text(job_id), connection=self.connection)
+                                  for job_id in pipe.smembers(dependents_key)]
+
+                pipe.multi()
+
+                for dependent in dependent_jobs:
+                    registry = DeferredJobRegistry(dependent.origin,
+                                                   self.connection,
+                                                   job_class=self.job_class)
+                    registry.remove(dependent, pipeline=pipe)
+                    if dependent.origin == self.name:
+                        self.enqueue_job(dependent, pipeline=pipe)
+                    else:
+                        queue = Queue(name=dependent.origin, connection=self.connection)
+                        queue.enqueue_job(dependent, pipeline=pipe)
+
+                pipe.delete(dependents_key)
 
                 if pipeline is None:
                     pipe.execute()
 
                 break
-
             except WatchError:
                 if pipeline is None:
                     continue
