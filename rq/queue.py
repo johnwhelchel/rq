@@ -115,7 +115,7 @@ class Queue(object):
         except NoSuchJobError:
             self.remove(job_id)
         else:
-            if job.origin == self.name or (job.is_failed and self == get_failed_queue(connection=self.connection)):
+            if job.origin == self.name or (job.is_failed and self == get_failed_queue(connection=self.connection, job_class=self.job_class)):
                 return job
 
     def get_job_ids(self, offset=0, length=-1):
@@ -232,6 +232,7 @@ class Queue(object):
                             job.register_dependencies(remaining_dependencies,
                                                       pipeline=pipe)
                             job.save(pipeline=pipe)
+                            job.cleanup(ttl=job.ttl, pipeline=pipe)
                             pipe.execute()
                             return job
                         break
@@ -307,6 +308,7 @@ class Queue(object):
         if job.timeout is None:
             job.timeout = self.DEFAULT_TIMEOUT
         job.save(pipeline=pipe)
+        job.cleanup(ttl=job.ttl, pipeline=pipe)
 
         if self._async:
             self.push_job_id(job.id, pipeline=pipe, at_front=at_front)
@@ -504,6 +506,7 @@ class FailedQueue(Queue):
             job.ended_at = utcnow()
             job.exc_info = exc_info
             job.save(pipeline=pipeline, include_meta=False)
+            job.cleanup(ttl=-1, pipeline=pipeline)  # failed job won't expire
 
             self.push_job_id(job.id, pipeline=pipeline)
             pipeline.execute()
