@@ -328,6 +328,10 @@ class Queue(object):
     def enqueue_dependents(self, job, pipeline=None):
         """Enqueues all jobs in the given job's dependents set and clears it.
 
+        Usually this is called by the worker which watches the dependency key of
+        the job for changes. This prevents jobs being lost which are enqueued
+        during this function call
+
         When called without a pipeline, this method uses WATCH/MULTI/EXEC.
         If you pass a pipeline, only MULTI is called. The rest is up to the
         caller.
@@ -337,6 +341,7 @@ class Queue(object):
         pipe = pipeline if pipeline is not None else self.connection._pipeline()
         dependents_key = job.dependents_key
 
+        to_enqueue = []
         while True:
             try:
                 # if a pipeline is passed, the caller is responsible for calling WATCH
@@ -349,30 +354,25 @@ class Queue(object):
 
                 pipe.multi()
 
+                # Collect dependents to be enqueued
                 for dependent in dependent_jobs:
                     dependent.remove_dependency(job.id)
-                    # TODO: pipelining of removal not possible since next if
-                    # expects an empty dependencies key. Is there a better way?
-                    # or is it ok if not everything is pipelined?
                     if dependent.has_unmet_dependencies() is False:
                         registry = DeferredJobRegistry(dependent.origin,
                                                        self.connection,
                                                        job_class=self.job_class)
                         registry.remove(dependent, pipeline=pipe)
                         if dependent.origin == self.name:
-                            self.enqueue_job(dependent, pipeline=pipe)
+                            queue = self
                         else:
                             queue = Queue(name=dependent.origin, connection=self.connection)
-                            queue.enqueue_job(dependent, pipeline=pipe)
 
-                # This job is done and its dependents will never be checked
-                # again. If a dependent had multiple dependencies, another job
-                # will run it at a later time
-                # NOTE: on job cleanup, all keys will be removed, but cleanup
-                # happens only if job is actually enqueued. If a user uses
-                # q.enqueue_dependents manully without enqueuing the parent job,
-                # job.cleanup() is not run
-                # run as well
+                        to_enqueue.append({'queue': queue, 'job': dependent})
+
+                # NOTE: On job cleanup, all keys will be removed, but cleanup
+                # happens only if parent job is actually enqueued.
+                # If a user uses q.enqueue_dependents manually without enqueuing
+                # the parent job, job.cleanup() is not run for the parent job
                 pipe.delete(job.dependents_key)
 
                 if pipeline is None:
@@ -380,13 +380,29 @@ class Queue(object):
 
                 break
             except WatchError:
+                # The dependents key of the finished job has changed
+                # Check dependents again
                 if pipeline is None:
                     continue
                 else:
-                    # if the pipeline comes from the caller, we re-raise the
+                    # If the pipeline comes from the caller, we re-raise the
                     # exception as it it the responsibility of the caller to
                     # handle it
                     raise
+
+        # Do actual enqueuing of dependents while watching for enqueuing of the
+        # same dependent by another worker
+        for item in to_enqueue:
+            try:
+                if pipeline is None:
+                    pipe.watch(item['job'].key)
+                pipe.multi()
+                item['queue'].enqueue_job(item['job'], pipeline=pipe)
+                if pipeline is None:
+                    pipe.execute()
+            except WatchError:
+                # Another worker enqueued this job which changed its status
+                pass
 
     def pop_job_id(self):
         """Pops a given job ID from this Redis queue."""
